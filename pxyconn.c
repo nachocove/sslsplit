@@ -1432,6 +1432,121 @@ pxy_conn_terminate_free(pxy_conn_ctx_t *ctx)
 }
 
 /*
+ * Description:
+ *   Find and replace text within a string.
+ *
+ * Parameters:
+ *   src  (in) - pointer to source string
+ *   from (in) - pointer to search text
+ *   to   (in) - pointer to replacement text
+ *
+ * Returns:
+ *   Returns a pointer to dynamically-allocated memory containing string
+ *   with occurences of the text pointed to by 'from' replaced by with the
+ *   text pointed to by 'to'.
+ */
+char *replacestr(const char *src, const char *from, const char *to)
+{
+   /*
+	* Find out the lengths of the source string, text to replace, and
+	* the replacement text.
+	*/
+   size_t size    = strlen(src) + 1;
+   size_t fromlen = strlen(from);
+   size_t tolen   = strlen(to);
+   /*
+	* Allocate the first chunk with enough for the original string.
+	*/
+   char *value = malloc(size);
+   /*
+	* We need to return 'value', so let's make a copy to mess around with.
+	*/
+   char *dst = value;
+   /*
+	* Before we begin, let's see if malloc was successful.
+	*/
+   if ( value != NULL )
+   {
+	  /*
+	   * Loop until no matches are found.
+	   */
+	  for ( ;; )
+	  {
+		 /*
+		  * Try to find the search text.
+		  */
+		 const char *match = strstr(src, from);
+		 if ( match != NULL )
+		 {
+			/*
+			 * Found search text at location 'match'. :)
+			 * Find out how many characters to copy up to the 'match'.
+			 */
+			size_t count = match - src;
+			/*
+			 * We are going to realloc, and for that we will need a
+			 * temporary pointer for safe usage.
+			 */
+			char *temp;
+			/*
+			 * Calculate the total size the string will be after the
+			 * replacement is performed.
+			 */
+			size += tolen - fromlen;
+			/*
+			 * Attempt to realloc memory for the new size.
+			 */
+			temp = realloc(value, size);
+			if ( temp == NULL )
+			{
+			   /*
+				* Attempt to realloc failed. Free the previously malloc'd
+				* memory and return with our tail between our legs. :(
+				*/
+			   free(value);
+			   return NULL;
+			}
+			/*
+			 * The call to realloc was successful. :) But we'll want to
+			 * return 'value' eventually, so let's point it to the memory
+			 * that we are now working with. And let's not forget to point
+			 * to the right location in the destination as well.
+			 */
+			dst = temp + (dst - value);
+			value = temp;
+			/*
+			 * Copy from the source to the point where we matched. Then
+			 * move the source pointer ahead by the amount we copied. And
+			 * move the destination pointer ahead by the same amount.
+			 */
+			memmove(dst, src, count);
+			src += count;
+			dst += count;
+			/*
+			 * Now copy in the replacement text 'to' at the position of
+			 * the match. Adjust the source pointer by the text we replaced.
+			 * Adjust the destination pointer by the amount of replacement
+			 * text.
+			 */
+			memmove(dst, to, tolen);
+			src += fromlen;
+			dst += tolen;
+		 }
+		 else /* No match found. */
+		 {
+			/*
+			 * Copy any remaining part of the string. This includes the null
+			 * termination character.
+			 */
+			strcpy(dst, src);
+			break;
+		 }
+	  }
+   }
+   return value;
+}
+
+/*
  * Callback for read events on the up- and downstram connection bufferevents.
  * Called when there is data ready in the input evbuffer.
  */
@@ -1559,6 +1674,44 @@ pxy_bev_readcb(struct bufferevent *bev, void *arg)
 		}
 		if (!ctx->seen_resp_header)
 			return;
+	} else
+	if (!ctx->spec->http && (bev == ctx->dst.bev) && !ctx->passthrough) {
+		logbuf_t *lb = NULL, *tail = NULL;
+		char *line;
+		while ((line = evbuffer_readln(inbuf, NULL,
+		                               EVBUFFER_EOL_CRLF))) {
+			char *replace = NULL;
+			if (WANT_CONTENT_LOG(ctx)) {
+				logbuf_t *tmp;
+				tmp = logbuf_new_printf(NULL, NULL,
+				                        "%s\r\n", line);
+				if (tail) {
+					if (tmp) {
+						tail->next = tmp;
+						tail = tail->next;
+					}
+				} else {
+					lb = tail = tmp;
+				}
+			}
+			if (strstr(line, "COMPRESS=DEFLATE") != NULL) {
+				replace = replacestr(line, "COMPRESS=DEFLATE", "");
+				evbuffer_add_printf(outbuf, "%s\r\n", replace);
+				free(replace);
+			} else {
+				evbuffer_add_printf(outbuf, "%s\r\n", line);
+			}
+			free(line);
+		}
+		if (lb && WANT_CONTENT_LOG(ctx)) {
+			if (log_content_submit(ctx->logctx, lb,
+								   1/*req*/) == -1) {
+				logbuf_free(lb);
+				log_err_printf("Warning: Content log "
+							   "submission failed\n");
+			}
+		}
+		return;
 	}
 
 	/* out of memory condition? */
